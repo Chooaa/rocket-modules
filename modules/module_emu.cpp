@@ -1,0 +1,450 @@
+/*
+ * module_emu.cpp — Shared C++ emulator driver for standalone module fuzzing.
+ *
+ * Provides:
+ *   - fuzz_get_byte() DPI-C: feeds fuzzer input bytes to the SV wrapper
+ *   - Two entry modes: FUZZER_LIB (linked with libfuzzer.a) or standalone
+ *   - Verilator simulation loop with reset, clock toggle, io_success check
+ *   - FIRRTL coverage integration (firrtl-cover.h/cpp)
+ *   - Optional VCD trace (VM_TRACE)
+ */
+
+#include "verilated.h"
+
+#if VM_TRACE
+#include <memory>
+#include "verilated_vcd_c.h"
+#endif
+
+#ifdef FIRRTL_COVER
+#include "firrtl-cover.h"
+#endif
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <getopt.h>
+#include <signal.h>
+
+#include "VSimTop.h"
+
+// ── Fuzz input buffer ────────────────────────────────────────────────
+static const uint8_t *fuzz_buf = nullptr;
+static size_t fuzz_buf_len = 0;
+static size_t fuzz_buf_pos = 0;
+
+extern "C" unsigned char fuzz_get_byte() {
+    if (fuzz_buf && fuzz_buf_pos < fuzz_buf_len) {
+        // printf("FUZZ_GET_BYTE: pos=%zu, byte=0x%02x\n", fuzz_buf_pos, fuzz_buf[fuzz_buf_pos]);
+        return fuzz_buf[fuzz_buf_pos++];
+    }
+    return 0;
+}
+
+// ── Simulation state ─────────────────────────────────────────────────
+static uint64_t trace_count = 0;
+static volatile bool sig_exit = false;
+
+double sc_time_stamp() { return trace_count; }
+
+extern "C" int vpi_get_vlog_info(void *arg) { return 0; }
+
+static void handle_sigterm(int) { sig_exit = true; }
+
+// ── Coverage helpers ─────────────────────────────────────────────────
+#ifdef FIRRTL_COVER
+static const int n_cover_types =
+    sizeof(firrtl_cover) / sizeof(FIRRTLCoverPointParam);
+
+static uint32_t get_cover_total() {
+    uint32_t total = 0;
+    for (int i = 0; i < n_cover_types; i++) {
+        total += firrtl_cover[i].cover.total;
+    }
+    return total;
+}
+
+static uint32_t get_cover_hit() {
+    uint32_t hit = 0;
+    for (int i = 0; i < n_cover_types; i++) {
+        for (uint64_t j = 0; j < firrtl_cover[i].cover.total; j++) {
+            if (firrtl_cover[i].cover.points[j]) hit++;
+        }
+    }
+    return hit;
+}
+
+static void reset_cover() {
+    for (int i = 0; i < n_cover_types; i++) {
+        memset(firrtl_cover[i].cover.points, 0, firrtl_cover[i].cover.total);
+    }
+}
+
+static void display_cover() {
+    for (int i = 0; i < n_cover_types; i++) {
+        uint32_t total = firrtl_cover[i].cover.total;
+        uint32_t hit = 0;
+        for (uint64_t j = 0; j < total; j++) {
+            if (firrtl_cover[i].cover.points[j]) hit++;
+        }
+        fprintf(stderr, "COVERAGE: %s, %u / %u (%.1f%%)\n",
+                firrtl_cover[i].cover.name, hit, total,
+                total ? 100.0 * hit / total : 0.0);
+    }
+}
+#endif // FIRRTL_COVER
+
+// ── Accumulative coverage for fuzzer feedback ────────────────────────
+#ifdef FIRRTL_COVER
+static uint8_t **acc_cover = nullptr;
+
+static void init_acc_cover() {
+    acc_cover = new uint8_t *[n_cover_types];
+    for (int i = 0; i < n_cover_types; i++) {
+        acc_cover[i] = new uint8_t[firrtl_cover[i].cover.total]();
+    }
+}
+
+static void accumulate_cover() {
+    for (int i = 0; i < n_cover_types; i++) {
+        for (uint64_t j = 0; j < firrtl_cover[i].cover.total; j++) {
+            if (firrtl_cover[i].cover.points[j]) {
+                acc_cover[i][j] = 1;
+            }
+        }
+    }
+}
+
+static uint32_t get_acc_cover_hit() {
+    uint32_t hit = 0;
+    for (int i = 0; i < n_cover_types; i++) {
+        for (uint64_t j = 0; j < firrtl_cover[i].cover.total; j++) {
+            if (acc_cover[i][j]) hit++;
+        }
+    }
+    return hit;
+}
+
+static void free_acc_cover() {
+    if (acc_cover) {
+        for (int i = 0; i < n_cover_types; i++) delete[] acc_cover[i];
+        delete[] acc_cover;
+        acc_cover = nullptr;
+    }
+}
+#endif // FIRRTL_COVER
+
+// ── Exported interface for fuzzer library ────────────────────────────
+#ifdef FUZZER_LIB
+extern "C" uint32_t get_cover_number() {
+#ifdef FIRRTL_COVER
+    return get_cover_total();
+#else
+    return 0;
+#endif
+}
+
+extern "C" void update_stats(uint8_t *bytes) {
+#ifdef FIRRTL_COVER
+    for (int i = 0; i < n_cover_types; i++) {
+        memcpy(bytes, firrtl_cover[i].cover.points, firrtl_cover[i].cover.total);
+        bytes += firrtl_cover[i].cover.total;
+    }
+#endif
+}
+
+static bool _sim_verbose = false;
+
+extern "C" void set_cover_feedback(const char *) {
+    // In standalone mode, feedback cover is always the first type.
+}
+
+extern "C" void enable_sim_verbose()  { _sim_verbose = true;  }
+extern "C" void disable_sim_verbose() { _sim_verbose = false; }
+#endif // FUZZER_LIB
+
+uint64_t fuzz_id = 0;
+inline char *snapshot_wavefile_name(uint64_t cycle) {
+    static char buf[1024];
+    const char *noop_home = getenv("NOOP_HOME");
+    assert(noop_home && "NOOP_HOME environment variable must be set for snapshot waveforms");
+    snprintf(buf, sizeof(buf), "%s/tmp/fuzz_run/%lu/snapshot-%lu.vcd", noop_home, fuzz_id, cycle);
+    return buf;
+}
+
+bool dump_snapshot = false;
+uint64_t snapshot_cycle = 0;
+
+// ── Simulation core ──────────────────────────────────────────────────
+
+static int run_sim(const uint8_t *input, size_t input_len,
+                   uint64_t max_cycles, const char *vcd_path) {
+    fuzz_buf = input;
+    fuzz_buf_len = input_len;
+    fuzz_buf_pos = 0;
+    trace_count = 0;
+
+    Verilated::randReset(2);
+    Verilated::gotError(false);
+    Verilated::gotFinish(false);
+    Verilated::fatalOnError(false);
+
+    VSimTop *top = new VSimTop;
+
+#if VM_TRACE
+    Verilated::traceEverOn(true);
+    VerilatedVcdC *tfp = nullptr;
+    VerilatedVcdC *snapshot_tfp = nullptr;
+    if (dump_snapshot) {
+        // snapshot_cycle: a random cycle between 20% and 80% of max_cycles, to capture interesting intermediate state without being too early or too late
+        uint64_t seed = (unsigned)time(nullptr) ^ (unsigned)fuzz_id;
+        printf("Random seed for snapshot cycle: %lu\n", seed);
+        srand(seed);
+        snapshot_cycle = max_cycles / 5 + (rand() % (max_cycles / 5 * 3));
+        printf("Snapshot dumping enabled, will save VCD at cycle %lu\n", snapshot_cycle);
+    }
+    if (vcd_path) {
+        tfp = new VerilatedVcdC;
+        top->trace(tfp, 99);
+        tfp->open(vcd_path);
+    }
+#endif
+
+#ifdef FIRRTL_COVER
+    reset_cover();
+#endif
+
+    int ret = 0;
+    bool done_reset = false;
+
+    const int reset_cycles = 10;
+
+    while (trace_count < max_cycles && !sig_exit) {
+        if (Verilated::gotError() || Verilated::gotFinish())
+        // if (Verilated::gotError())
+            break;
+        // if (done_reset)
+        //     break;
+        
+        // printf("Cycle %lu: reset=%d\n", trace_count, (trace_count < (uint64_t)reset_cycles) ? 1 : 0);
+
+        top->clock = 0;
+        top->reset = (trace_count < (uint64_t)reset_cycles) ? 1 : 0;
+        done_reset = !top->reset;
+        top->eval();
+        if (Verilated::gotError()) break;
+
+#if VM_TRACE
+        if (tfp) tfp->dump(static_cast<vluint64_t>(trace_count * 2));
+        if (dump_snapshot && trace_count == snapshot_cycle) {
+            snapshot_tfp = new VerilatedVcdC;
+            top->trace(snapshot_tfp, 99);
+            snapshot_tfp->open(snapshot_wavefile_name(trace_count));
+            snapshot_tfp->dump(static_cast<vluint64_t>(trace_count * 2));
+        }
+#endif
+
+        top->clock = 1;
+        top->eval();
+        if (Verilated::gotError()) break;
+
+#if VM_TRACE
+        if (tfp) tfp->dump(static_cast<vluint64_t>(trace_count * 2 + 1));
+        if (dump_snapshot && trace_count == snapshot_cycle && snapshot_tfp) {
+            snapshot_tfp->dump(static_cast<vluint64_t>(trace_count * 2 + 1));
+            snapshot_tfp->close();
+            delete snapshot_tfp;
+            snapshot_tfp = nullptr;
+            printf("Snapshot VCD saved: %s\n", snapshot_wavefile_name(trace_count));
+        }
+#endif
+        // printf("Cycle %lu: sig_exit=%s\n", trace_count, sig_exit ? "true" : "false");
+        trace_count++;
+    }
+
+    if (Verilated::gotError()) {
+        ret = 1;
+    } else if (trace_count >= max_cycles) {
+        ret = 2;
+    }
+
+    printf("Simulation finished after %lu cycles, result: %s\n", trace_count,
+           (ret == 0) ? "PASS" : (ret == 1) ? "FAIL" : "TIMEOUT");
+
+#if VM_TRACE
+    if (tfp) {
+        tfp->close();
+        delete tfp;
+    }
+#endif
+
+    delete top;
+    return ret;
+}
+
+// ── Entry points ─────────────────────────────────────────────────────
+
+#ifdef FUZZER_LIB
+
+extern "C" int sim_main(int argc, const char **argv) {
+    Verilated::commandArgs(argc, argv);
+
+    uint64_t max_cycles = 10000;
+
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--max-cycles=", 13) == 0) {
+            max_cycles = strtoull(argv[i] + 13, nullptr, 10);
+        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            max_cycles = strtoull(argv[++i], nullptr, 10);
+        }
+        else if (strncmp(argv[i], "--fuzz-id", 11) == 0 && i + 1 < argc) {
+            fuzz_id = strtoull(argv[++i], nullptr, 10);
+        }
+        else if (strcmp(argv[i], "--dump-snapshot") == 0) {
+            dump_snapshot = true;
+        }
+    }
+
+    // printf("Max cycles: %lu\n", max_cycles);
+    // printf("Fuzz ID: %lu\n", fuzz_id);
+
+    const uint8_t *input = nullptr;
+    size_t input_len = 0;
+    bool input_is_borrowed = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+            const char *path = argv[++i];
+            // wim@0xADDR+0xLEN — workload-in-memory from Rust fuzzer
+            if (strncmp(path, "wim@", 4) == 0) {
+                char *endp;
+                uintptr_t addr = strtoull(path + 4, &endp, 16);
+                if (*endp == '+') {
+                    input_len = (size_t)strtoull(endp + 1, nullptr, 16);
+                    input = reinterpret_cast<const uint8_t *>(addr);
+                    input_is_borrowed = true;
+                }
+            } else {
+                FILE *fp = fopen(path, "rb");
+                if (fp) {
+                    fseek(fp, 0, SEEK_END);
+                    input_len = ftell(fp);
+                    printf("Read input file: %s, size: %zu bytes\n", path, input_len);
+                    fseek(fp, 0, SEEK_SET);
+                    uint8_t *buf = new uint8_t[input_len];
+                    if (fread(buf, 1, input_len, fp) == input_len)
+                        input = buf;
+                    fclose(fp);
+                }
+            }
+        }
+    }
+
+#ifdef FIRRTL_COVER
+    init_acc_cover();
+    reset_cover();
+#endif
+
+    int ret = run_sim(input, input_len, max_cycles, nullptr);
+
+#ifdef FIRRTL_COVER
+    accumulate_cover();
+    display_cover();
+    free_acc_cover();
+#endif
+
+    if (!input_is_borrowed)
+        delete[] input;
+    return ret;
+}
+
+#else // standalone mode
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: %s [options]\n"
+        "  -i FILE        Input binary file for fuzz bytes\n"
+        "  -m CYCLES      Max simulation cycles (default: 100000)\n"
+        "  -v FILE        VCD output file\n"
+        "  -s SEED        Random seed\n"
+        "  -h             Show this help\n",
+        prog);
+}
+
+int main(int argc, char **argv) {
+    uint64_t max_cycles = 100000;
+    unsigned seed = 0;
+    const char *input_path = nullptr;
+    const char *vcd_path = nullptr;
+    bool has_seed = false;
+
+    int opt;
+    while ((opt = getopt(argc, argv, "i:m:v:s:d:h")) != -1) {
+        switch (opt) {
+        case 'i': input_path = optarg; break;
+        case 'm': max_cycles = strtoull(optarg, nullptr, 10); break;
+        case 'v': vcd_path = optarg; break;
+        case 's': seed = atoi(optarg); has_seed = true; break;
+        case 'd': dump_snapshot = true; break;
+        case 'h':
+        default:  usage(argv[0]); return (opt == 'h') ? 0 : 1;
+        }
+    }
+
+    if (has_seed) {
+        srand(seed);
+        srand48(seed);
+    }
+
+    Verilated::commandArgs(argc, argv);
+
+    uint8_t *input = nullptr;
+    size_t input_len = 0;
+    if (input_path) {
+        FILE *fp = fopen(input_path, "rb");
+        if (!fp) {
+            fprintf(stderr, "ERROR: cannot open %s\n", input_path);
+            return 1;
+        }
+        fseek(fp, 0, SEEK_END);
+        input_len = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        input = new uint8_t[input_len];
+        if (fread(input, 1, input_len, fp) != input_len) {
+            fprintf(stderr, "ERROR: failed to read %s\n", input_path);
+            fclose(fp);
+            delete[] input;
+            return 1;
+        }
+        fclose(fp);
+    }
+
+    signal(SIGTERM, handle_sigterm);
+
+#ifdef FIRRTL_COVER
+    init_acc_cover();
+#endif
+
+    int ret = run_sim(input, input_len, max_cycles, vcd_path);
+
+#ifdef FIRRTL_COVER
+    accumulate_cover();
+    display_cover();
+    uint32_t total = get_cover_total();
+    uint32_t hit = get_acc_cover_hit();
+    fprintf(stderr, "COVERAGE TOTAL: %u / %u (%.1f%%)\n",
+            hit, total, total ? 100.0 * hit / total : 0.0);
+    free_acc_cover();
+#endif
+
+    if (ret == 2) {
+        fprintf(stderr, "*** TIMEOUT *** after %lu cycles\n", trace_count);
+    } else if (ret == 0) {
+        fprintf(stderr, "*** PASSED *** after %lu cycles\n", trace_count);
+    }
+
+    delete[] input;
+    return ret;
+}
+
+#endif // FUZZER_LIB
