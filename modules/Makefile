@@ -10,7 +10,8 @@ EMU_DIR    := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 RTL_DIR    := $(EMU_DIR)/rtl
 
 MODULE      ?= dcache
-BUILD_DIR   := $(EMU_DIR)/build
+# BUILD_DIR   := $(EMU_DIR)/build
+BUILD_DIR   := $(EMU_DIR)/../build
 # BUILD_DIR   := $(BUILD_BASE)/$(MODULE)
 BMCFUZZ ?=
 ifneq ($(BMCFUZZ),)

@@ -72,7 +72,6 @@ modules:
 
 clean:
 	rm -rf $(BUILD_DIR)
-	rm -rf modules/build
 
 idea:
 	mill -i mill.idea.GenIdea/idea

@@ -106,10 +106,11 @@ def setup_project(project_name, include_generic=False, renumber=True, insert_ini
     完整流程:
       1. 运行 svinst 解析 $NOOP_HOME/build/rtl/SimTop.sv 生成 YAML
       2. 解析 YAML 获取模块层次，收集目标模块
-      3. 从源 SimTop.sv 中提取目标模块代码 → modules/rtl/<root>_modules.sv
-      4. 生成顶层 fuzz wrapper → modules/rtl/SimTop.sv
+      3. 从源 SimTop.sv 中提取目标模块代码
+      4. 生成顶层 fuzz wrapper 并追加提取的模块代码 → modules/rtl/SimTop.sv
       5. 复制并过滤 firrtl-cover 文件 → modules/rtl/
       6. 复制 GEN_* 覆盖点模块文件 → modules/rtl/
+      7. 生成形式验证顶层 FormalTop.sv → modules/FormalTop.sv
 
     Returns:
         dict with keys: root_modules, sv_path, yaml_path, rtl_dir, modules, target_mods
@@ -152,16 +153,20 @@ def setup_project(project_name, include_generic=False, renumber=True, insert_ini
     print(f"[INFO] 目标模块 (root: {', '.join(root_modules)}): 共 {len(target_mods)} 个")
 
     # ---- Step 3: 从源 SimTop.sv 提取目标模块代码 ----
-    extracted_sv = os.path.join(RTL_DIR, f"{'_'.join(root_modules)}_modules.sv")
-    print(f"\n--- Step 3: 提取目标模块代码 -> {extracted_sv} ---")
-    extract_modules(src_simtop, target_mods, extracted_sv,
-                    renumber=renumber, insert_initial=insert_initial)
+    print(f"\n--- Step 3: 提取目标模块代码 ---")
+    extracted_text = extract_modules(src_simtop, target_mods,
+                                     renumber=renumber, insert_initial=insert_initial)
 
-    # ---- Step 4: 生成顶层 fuzz wrapper (SimTop.sv) ----
+    # ---- Step 4: 生成顶层 fuzz wrapper (SimTop.sv) 并追加提取的模块代码 ----
     wrapper_sv = os.path.join(RTL_DIR, "SimTop.sv")
     fuzz_top = root_modules[0]
     print(f"\n--- Step 4: 生成顶层包裹 SimTop.sv (包裹 {fuzz_top}) ---")
     generate_fuzz_wrapper(src_simtop, fuzz_top, wrapper_sv)
+
+    with open(wrapper_sv, "a") as f:
+        f.write("\n")
+        f.write(extracted_text)
+    print(f"[INFO] 已将提取的模块代码追加到 {wrapper_sv}")
 
     # ---- Step 5: 复制并过滤 firrtl-cover 文件 ----
     print(f"\n--- Step 5: 处理 firrtl-cover 文件 ---")
@@ -200,18 +205,17 @@ def setup_project(project_name, include_generic=False, renumber=True, insert_ini
 
     print(f"\n{'=' * 70}")
     print(f"[INFO] 项目 {project_name} 初始化完成")
-    print(f"  - 提取模块代码: {extracted_sv}")
-    print(f"  - 顶层包裹:     {wrapper_sv}")
-    print(f"  - FormalTop:     {formal_sv}")
+    print(f"  - SimTop (wrapper + 模块): {wrapper_sv}")
+    print(f"  - FormalTop:               {formal_sv}")
     cover_filtered_path = os.path.join(RTL_DIR, "firrtl-cover-filtered.cpp")
     if os.path.isfile(cover_filtered_path):
-        print(f"  - 过滤后 cover: {cover_filtered_path}")
-    print(f"  - GEN_* 文件:   {len(gen_files)} 个")
+        print(f"  - 过滤后 cover:            {cover_filtered_path}")
+    print(f"  - GEN_* 文件:              {len(gen_files)} 个")
     print(f"{'=' * 70}")
 
     return {
         "root_modules": root_modules,
-        "sv_path": extracted_sv,
+        "sv_path": wrapper_sv,
         "yaml_path": yaml_path,
         "rtl_dir": RTL_DIR,
         "modules": modules,
@@ -590,20 +594,22 @@ def extract_modules(sv_path, mod_names, output_path=None, renumber=True, insert_
 
     text = "".join(output_lines)
 
+    total_lines = sum(e - s + 1 for _, (s, e) in sorted_mods)
+    print(f"[INFO] 已提取 {len(sorted_mods)} 个模块 ({total_lines} 行)")
+    if insert_initial:
+        print(f"[INFO] 寄存器初始化: 共 {total_init_regs} 个寄存器插入 initial 语句")
+    if renumber:
+        summary = ", ".join(
+            f"{totals[k]} {k} (0-{max(totals[k]-1,0)})" for k in cover_kinds
+        )
+        print(f"[INFO] 覆盖点重新编号: {summary}")
+
     if output_path:
         with open(output_path, "w") as f:
             f.write(text)
-        total_lines = sum(e - s + 1 for _, (s, e) in sorted_mods)
-        print(f"[INFO] 已提取 {len(sorted_mods)} 个模块 ({total_lines} 行) -> {output_path}")
-        if insert_initial:
-            print(f"[INFO] 寄存器初始化: 共 {total_init_regs} 个寄存器插入 initial 语句")
-        if renumber:
-            summary = ", ".join(
-                f"{totals[k]} {k} (0-{max(totals[k]-1,0)})" for k in cover_kinds
-            )
-            print(f"[INFO] 覆盖点重新编号: {summary}")
-    else:
-        print(text)
+        print(f"[INFO] 输出到: {output_path}")
+
+    return text
 
 # ============================================================
 # 5. 过滤 firrtl-cover.cpp 中不属于指定模块的覆盖点
@@ -934,8 +940,8 @@ def main():
     parser.add_argument("--max-depth", type=int, default=None, help="树形打印最大深度")
     parser.add_argument("--no-renumber", action="store_true",
                         help="提取时不对覆盖点重新编号")
-    parser.add_argument("--no-initial", action="store_true",
-                        help="提取时不插入寄存器 initial 语句块")
+    parser.add_argument("--initial", action="store_true",
+                        help="提取时插入寄存器 initial 语句块")
     parser.add_argument("--all", action="store_true", help="执行所有操作: 打印模块树 + 列出模块 + 提取代码")
     parser.add_argument("--filter-cover", action="store_true", help="过滤 firrtl-cover.cpp 中的覆盖点")
     parser.add_argument("--cover-input", default=None,
@@ -970,7 +976,7 @@ def main():
             args.project_name,
             include_generic=args.include_generic,
             renumber=not args.no_renumber,
-            insert_initial=not args.no_initial,
+            insert_initial=args.initial,
         )
         if project_result is None:
             print("[ERROR] 项目初始化失败", file=sys.stderr)
@@ -1077,7 +1083,7 @@ def main():
         print("=" * 70)
         extract_modules(sv_path, target_mods, output_path,
                         renumber=not args.no_renumber,
-                        insert_initial=not args.no_initial)
+                        insert_initial=args.initial)
 
     # 过滤 firrtl-cover.cpp 中的覆盖点
     if args.filter_cover or args.all:
