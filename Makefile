@@ -1,3 +1,6 @@
+# .PHONY: bootrom sim-verilog emu src fuzzer ccover modules clean idea init verilog clean-all
+.PHONY: modules
+
 CHISEL_VERSION = 6.5.0
 
 FUZZ_TOP  = freechips.rocketchip.system.FuzzMain
@@ -10,7 +13,7 @@ TOP_V      = $(RTL_DIR)/SimTop.$(RTL_SUFFIX)
 MILL_ARGS = --target-dir $(RTL_DIR) \
             --full-stacktrace
 
-ifeq ($(BMCFUZZ),1)
+ifneq ($(XFUZZ),)
 CHISEL_VERSION = 3.6.1
 endif
 
@@ -64,8 +67,12 @@ fuzzer:
 ccover:
 	@$(MAKE) -C ./ccover build
 
+modules:
+	@$(MAKE) -C modules emu
+
 clean:
 	rm -rf $(BUILD_DIR)
+	rm -rf modules/build
 
 idea:
 	mill -i mill.idea.GenIdea/idea
