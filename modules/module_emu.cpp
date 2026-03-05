@@ -13,7 +13,13 @@
 
 #if VM_TRACE
 #include <memory>
+#if VM_TRACE_FST
+#include "verilated_fst_c.h"
+typedef VerilatedFstC TraceFile;
+#else
 #include "verilated_vcd_c.h"
+typedef VerilatedVcdC TraceFile;
+#endif
 #endif
 
 #ifdef FIRRTL_COVER
@@ -173,6 +179,7 @@ inline char *snapshot_wavefile_name(uint64_t cycle) {
     return buf;
 }
 
+bool run_snapshot = false;
 bool dump_snapshot = false;
 uint64_t snapshot_cycle = 0;
 
@@ -194,8 +201,8 @@ static int run_sim(const uint8_t *input, size_t input_len,
 
 #if VM_TRACE
     Verilated::traceEverOn(true);
-    VerilatedVcdC *tfp = nullptr;
-    VerilatedVcdC *snapshot_tfp = nullptr;
+    TraceFile *tfp = nullptr;
+    TraceFile *snapshot_tfp = nullptr;
     if (dump_snapshot) {
         // snapshot_cycle: a random cycle between 20% and 80% of max_cycles, to capture interesting intermediate state without being too early or too late
         uint64_t seed = (unsigned)time(nullptr) ^ (unsigned)fuzz_id;
@@ -205,7 +212,7 @@ static int run_sim(const uint8_t *input, size_t input_len,
         printf("Snapshot dumping enabled, will save VCD at cycle %lu\n", snapshot_cycle);
     }
     if (vcd_path) {
-        tfp = new VerilatedVcdC;
+        tfp = new TraceFile;
         top->trace(tfp, 99);
         tfp->open(vcd_path);
     }
@@ -216,7 +223,7 @@ static int run_sim(const uint8_t *input, size_t input_len,
 #endif
 
     int ret = 0;
-    bool done_reset = false;
+    // bool done_reset = false;
 
     const int reset_cycles = 10;
 
@@ -230,15 +237,19 @@ static int run_sim(const uint8_t *input, size_t input_len,
         // printf("Cycle %lu: reset=%d\n", trace_count, (trace_count < (uint64_t)reset_cycles) ? 1 : 0);
 
         top->clock = 0;
-        top->reset = (trace_count < (uint64_t)reset_cycles) ? 1 : 0;
-        done_reset = !top->reset;
+        if (!run_snapshot) {
+            top->reset = (trace_count < (uint64_t)reset_cycles) ? 1 : 0;
+        } else {
+            top->reset = 0;
+        }
+        // done_reset = !top->reset;
         top->eval();
         if (Verilated::gotError()) break;
 
 #if VM_TRACE
         if (tfp) tfp->dump(static_cast<vluint64_t>(trace_count * 2));
         if (dump_snapshot && trace_count == snapshot_cycle) {
-            snapshot_tfp = new VerilatedVcdC;
+            snapshot_tfp = new TraceFile;
             top->trace(snapshot_tfp, 99);
             snapshot_tfp->open(snapshot_wavefile_name(trace_count));
             snapshot_tfp->dump(static_cast<vluint64_t>(trace_count * 2));
@@ -291,15 +302,21 @@ extern "C" int sim_main(int argc, const char **argv) {
     Verilated::commandArgs(argc, argv);
 
     uint64_t max_cycles = 10000;
-
+    const char *wave_path = nullptr;
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--max-cycles=", 13) == 0) {
             max_cycles = strtoull(argv[i] + 13, nullptr, 10);
         } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             max_cycles = strtoull(argv[++i], nullptr, 10);
         }
+        else if (strcmp(argv[i], "--dump-wave") == 0) {
+            wave_path = argv[++i];
+        }
         else if (strncmp(argv[i], "--fuzz-id", 11) == 0 && i + 1 < argc) {
             fuzz_id = strtoull(argv[++i], nullptr, 10);
+        }
+        else if (strcmp(argv[i], "--run-snapshot") == 0) {
+            run_snapshot = true;
         }
         else if (strcmp(argv[i], "--dump-snapshot") == 0) {
             dump_snapshot = true;
@@ -345,7 +362,7 @@ extern "C" int sim_main(int argc, const char **argv) {
     reset_cover();
 #endif
 
-    int ret = run_sim(input, input_len, max_cycles, nullptr);
+    int ret = run_sim(input, input_len, max_cycles, wave_path);
 
 #ifdef FIRRTL_COVER
     accumulate_cover();
@@ -379,12 +396,13 @@ int main(int argc, char **argv) {
     bool has_seed = false;
 
     int opt;
-    while ((opt = getopt(argc, argv, "i:m:v:s:d:h")) != -1) {
+    while ((opt = getopt(argc, argv, "i:m:v:s:r:d:h")) != -1) {
         switch (opt) {
         case 'i': input_path = optarg; break;
         case 'm': max_cycles = strtoull(optarg, nullptr, 10); break;
         case 'v': vcd_path = optarg; break;
         case 's': seed = atoi(optarg); has_seed = true; break;
+        case 'r': run_snapshot = true; break;
         case 'd': dump_snapshot = true; break;
         case 'h':
         default:  usage(argv[0]); return (opt == 'h') ? 0 : 1;

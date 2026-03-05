@@ -50,10 +50,17 @@ else
 VFLAGS += +define+VERILATOR_LEGACY
 endif
 
-# VCD trace support
+# Waveform trace support (VCD or FST)
 EMU_TRACE ?=
+EMU_TRACE_FORMAT ?= fst
 ifneq ($(EMU_TRACE),)
+ifeq ($(EMU_TRACE_FORMAT),fst)
+VFLAGS += --trace-fst
+else
 VFLAGS += --trace
+endif
+VFLAGS += --trace-max-array 512
+VFLAGS += --trace-max-width 200000
 endif
 
 # ── Source files ──────────────────────────────────────────────────────
@@ -84,6 +91,9 @@ EMU_LDFLAGS =
 # Trace support
 ifneq ($(EMU_TRACE),)
 EMU_CXXFLAGS += -DVM_TRACE=1
+ifeq ($(EMU_TRACE_FORMAT),fst)
+EMU_CXXFLAGS += -DVM_TRACE_FST=1
+endif
 endif
 
 # ── Fuzzer mode ───────────────────────────────────────────────────────
