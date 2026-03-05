@@ -203,6 +203,11 @@ def setup_project(project_name, include_generic=False, renumber=True, insert_ini
     print(f"\n--- Step 7: 生成形式验证顶层 FormalTop.sv (包裹 {fuzz_top}) ---")
     generate_formal_wrapper(src_simtop, fuzz_top, formal_sv)
 
+    with open(formal_sv, "a") as f:
+        f.write("\n")
+        f.write(extracted_text)
+    print(f"[INFO] 已将提取的模块代码追加到 {formal_sv}")
+
     print(f"\n{'=' * 70}")
     print(f"[INFO] 项目 {project_name} 初始化完成")
     print(f"  - SimTop (wrapper + 模块): {wrapper_sv}")
@@ -789,6 +794,12 @@ def generate_fuzz_wrapper(sv_path, mod_name, output_path=None):
             lines.append(f"  wire [{width - 1}:0] {name};")
             lines.append(f"  assign {name} = reg_input[{bit_offset + width - 1}:{bit_offset}];")
         bit_offset += width
+    
+    # 将input按顺序保存到文件
+    fuzz_input_file = os.path.join(SCRIPT_DIR, "fuzz_inputs.txt")
+    with open(fuzz_input_file, "w") as f:
+        for _, width, name in fuzz_inputs:
+            f.write(f"{name}\n")
 
     # 为 output 声明 wire
     outputs = [(d, w, n) for d, w, n in all_ports if d == "output"]
@@ -842,6 +853,8 @@ def generate_formal_wrapper(sv_path, mod_name, output_path=None):
 
     skip_ports = {"clock", "reset"}
     exposed_ports = [(d, w, n) for d, w, n in ports if n not in skip_ports]
+    input_ports = [(d, w, n) for d, w, n in exposed_ports if d == "input"]
+    output_ports = [(d, w, n) for d, w, n in exposed_ports if d != "input"]
 
     module_ranges, orig_lines = find_module_ranges(sv_path)
     port_comments = {}
@@ -857,16 +870,16 @@ def generate_formal_wrapper(sv_path, mod_name, output_path=None):
     lines = []
     lines.append("`define SYNTHESIS")
     lines.append("module FormalTop (")
-
+    # FormalTop 仅保留 input 端口；output 在模块内用 wire 声明
     port_decls = []
-    for direction, width, name in exposed_ports:
+    for direction, width, name in input_ports:
         if width == 1:
             port_decls.append(f"  {direction:6s}        {name}")
         else:
             port_decls.append(f"  {direction:6s} [{width - 1}:0] {name}")
 
     for i, decl in enumerate(port_decls):
-        comment = port_comments.get(exposed_ports[i][2], "")
+        comment = port_comments.get(input_ports[i][2], "")
         sep = "," if i < len(port_decls) - 1 else ""
         lines.append(f"{decl}{sep}{comment}")
 
@@ -875,8 +888,17 @@ def generate_formal_wrapper(sv_path, mod_name, output_path=None):
     lines.append("(* gclk *) wire glb_clk;")
     lines.append("wire clock;")
     lines.append("wire reset;")
+    # DUT output 端口用 wire 声明
+    for direction, width, name in output_ports:
+        comment = port_comments.get(name, "")
+        if width == 1:
+            lines.append(f"wire {name};{comment}")
+        else:
+            lines.append(f"wire [{width - 1}:0] {name};{comment}")
+    if output_ports:
+        lines.append("")
     lines.append("")
-    lines.append("reg reg_reset = 1'b0;")
+    lines.append("reg reg_reset = 1'b1;")
     lines.append("always @(posedge glb_clk) begin")
     lines.append("  if (reg_reset) begin")
     lines.append("    reg_reset <= 1'b0;")
@@ -909,7 +931,7 @@ def generate_formal_wrapper(sv_path, mod_name, output_path=None):
         with open(output_path, "w") as f:
             f.write(text)
         print(f"[INFO] 已生成 FormalTop 包裹模块 -> {output_path}")
-        print(f"[INFO] 包裹模块: {mod_name}, 暴露端口: {len(exposed_ports)}")
+        print(f"[INFO] 包裹模块: {mod_name}, input 端口: {len(input_ports)}, output 用 wire: {len(output_ports)}")
     else:
         return text
 

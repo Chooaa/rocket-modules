@@ -37,4 +37,5 @@ scripts/bmcfuzz/__pycache__/
 
 modules/__pycache__
 modules/FormalTop.sv
+modules/fuzz_inputs.txt
 modules/rtl/*
