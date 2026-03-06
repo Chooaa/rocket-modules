@@ -41,6 +41,7 @@ TMP_DIR = os.path.join(NOOP_HOME, "tmp")
 PROJECT_CONFIGS = {
     "rocket_dcache": {
         "root_modules": ["NonBlockingDCache"],
+        # "root_modules": ["DCache"],
         "description": "DCache (NonBlockingDCache) 模块",
     },
 }
@@ -668,6 +669,20 @@ def filter_cover_cpp(input_path, output_path, allowed_modules):
             f'{kind}, {filt}UL',
             result,
         )
+
+    # 在 v_cover_control 中插入 new_points_covered 通知逻辑
+    new_cover_snippet = (
+        "    if (coverPoints.control[index] == 0) {\n"
+        "        extern bool new_points_covered;\n"
+        "        new_points_covered = true;\n"
+        "    }\n"
+    )
+    result = re.sub(
+        r'(extern "C" void v_cover_control\(uint64_t index\) \{\n)'
+        r'(\s*coverPoints\.control\[index\] = 1;)',
+        rf'\g<1>{new_cover_snippet}\2',
+        result,
+    )
 
     with open(output_path, "w") as f:
         f.write(result)

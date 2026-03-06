@@ -51,6 +51,11 @@ extern "C" unsigned char fuzz_get_byte() {
 // ── Simulation state ─────────────────────────────────────────────────
 static uint64_t trace_count = 0;
 static volatile bool sig_exit = false;
+static bool _sim_verbose = false;
+static char cover_feedback_name[1024] = {0};
+
+// global variable for record if new control cover points are covered (used by firrtl-cover.cpp v_cover_control)
+bool new_points_covered = false;
 
 double sc_time_stamp() { return trace_count; }
 
@@ -65,17 +70,35 @@ static const int n_cover_types =
 
 static uint32_t get_cover_total() {
     uint32_t total = 0;
-    for (int i = 0; i < n_cover_types; i++) {
-        total += firrtl_cover[i].cover.total;
+    if (strlen(cover_feedback_name) > 0 && cover_feedback_name[0] != '\0') {
+        for (int i = 0; i < n_cover_types; i++) {
+            if (strcmp(cover_feedback_name, firrtl_cover[i].cover.name) == 0) {
+                total += firrtl_cover[i].cover.total;
+            }
+        }
+    } else {
+        for (int i = 0; i < n_cover_types; i++) {
+            total += firrtl_cover[i].cover.total;
+        }
     }
     return total;
 }
 
 static uint32_t get_cover_hit() {
     uint32_t hit = 0;
-    for (int i = 0; i < n_cover_types; i++) {
-        for (uint64_t j = 0; j < firrtl_cover[i].cover.total; j++) {
-            if (firrtl_cover[i].cover.points[j]) hit++;
+    if (strlen(cover_feedback_name) > 0 && cover_feedback_name[0] != '\0') {
+        for (int i = 0; i < n_cover_types; i++) {
+            if (strcmp(cover_feedback_name, firrtl_cover[i].cover.name) == 0) {
+                for (uint64_t j = 0; j < firrtl_cover[i].cover.total; j++) {
+                    if (firrtl_cover[i].cover.points[j]) hit++;
+                }
+            }
+        }
+    } else {
+        for (int i = 0; i < n_cover_types; i++) {
+            for (uint64_t j = 0; j < firrtl_cover[i].cover.total; j++) {
+                if (firrtl_cover[i].cover.points[j]) hit++;
+            }
         }
     }
     return hit;
@@ -153,17 +176,26 @@ extern "C" uint32_t get_cover_number() {
 
 extern "C" void update_stats(uint8_t *bytes) {
 #ifdef FIRRTL_COVER
-    for (int i = 0; i < n_cover_types; i++) {
-        memcpy(bytes, firrtl_cover[i].cover.points, firrtl_cover[i].cover.total);
-        bytes += firrtl_cover[i].cover.total;
+    if (strlen(cover_feedback_name) > 0 && cover_feedback_name[0] != '\0') {
+        for (int i = 0; i < n_cover_types; i++) {
+            if (strcmp(cover_feedback_name, firrtl_cover[i].cover.name) == 0) {
+                memcpy(bytes, firrtl_cover[i].cover.points, firrtl_cover[i].cover.total);
+                bytes += firrtl_cover[i].cover.total;
+            }
+        }
+    } else {
+        for (int i = 0; i < n_cover_types; i++) {
+            memcpy(bytes, firrtl_cover[i].cover.points, firrtl_cover[i].cover.total);
+            bytes += firrtl_cover[i].cover.total;
+        }
     }
 #endif
 }
 
-static bool _sim_verbose = false;
-
-extern "C" void set_cover_feedback(const char *) {
+extern "C" void set_cover_feedback(const char *name) {
     // In standalone mode, feedback cover is always the first type.
+    strncpy(cover_feedback_name, name, sizeof(cover_feedback_name));
+    printf("Cover feedback name: %s\n", cover_feedback_name);
 }
 
 extern "C" void enable_sim_verbose()  { _sim_verbose = true;  }
@@ -175,7 +207,15 @@ inline char *snapshot_wavefile_name(uint64_t cycle) {
     static char buf[1024];
     const char *noop_home = getenv("NOOP_HOME");
     assert(noop_home && "NOOP_HOME environment variable must be set for snapshot waveforms");
-    snprintf(buf, sizeof(buf), "%s/tmp/fuzz_run/%lu/snapshot-%lu.vcd", noop_home, fuzz_id, cycle);
+    // snprintf(buf, sizeof(buf), "%s/tmp/fuzz_run/%lu/snapshot-%lu.fst", noop_home, fuzz_id, cycle);
+    snprintf(buf, sizeof(buf), "%s/tmp/fuzz_run/snapshot-%lu-%lu.fst", noop_home, fuzz_id, cycle);
+    return buf;
+}
+inline char *control_cover_points_file_name(uint64_t cycle) {
+    static char buf[1024];
+    const char *noop_home = getenv("NOOP_HOME");
+    assert(noop_home && "NOOP_HOME environment variable must be set for control cover points file");
+    snprintf(buf, sizeof(buf), "%s/tmp/fuzz_run/control_cover_points-%lu-%lu.csv", noop_home, fuzz_id, cycle);
     return buf;
 }
 
@@ -191,36 +231,40 @@ static int run_sim(const uint8_t *input, size_t input_len,
     fuzz_buf_len = input_len;
     fuzz_buf_pos = 0;
     trace_count = 0;
+    sig_exit = false;
 
-    Verilated::randReset(2);
-    Verilated::gotError(false);
-    Verilated::gotFinish(false);
-    Verilated::fatalOnError(false);
+    // Per-run context: avoids stale traceBaseModelCb accumulation in the
+    // global default context across repeated sim_main calls.
+    VerilatedContext *contextp = new VerilatedContext;
+    contextp->randReset(2);
+    contextp->gotError(false);
+    contextp->gotFinish(false);
+    contextp->fatalOnError(false);
 
-    VSimTop *top = new VSimTop;
+    VSimTop *top = new VSimTop{contextp};
 
 #if VM_TRACE
-    Verilated::traceEverOn(true);
+    contextp->traceEverOn(true);
     TraceFile *tfp = nullptr;
     TraceFile *snapshot_tfp = nullptr;
-    if (dump_snapshot) {
-        // snapshot_cycle: a random cycle between 20% and 80% of max_cycles, to capture interesting intermediate state without being too early or too late
-        uint64_t seed = (unsigned)time(nullptr) ^ (unsigned)fuzz_id;
-        printf("Random seed for snapshot cycle: %lu\n", seed);
-        srand(seed);
-        snapshot_cycle = max_cycles / 5 + (rand() % (max_cycles / 5 * 3));
-        printf("Snapshot dumping enabled, will save VCD at cycle %lu\n", snapshot_cycle);
-    }
+
     if (vcd_path) {
         tfp = new TraceFile;
         top->trace(tfp, 99);
         tfp->open(vcd_path);
     }
+    if (dump_snapshot) {
+        // Create ONE persistent snapshot trace; register it ONCE with top.
+        // Reuse via open/close per snapshot to avoid use-after-free from
+        // repeated top->trace() + delete cycles.
+        snapshot_tfp = new TraceFile;
+        top->trace(snapshot_tfp, 99);
+        printf("Snapshot dumping enabled, will save snapshot on new cover points\n");
+    }
 #endif
 
-#ifdef FIRRTL_COVER
-    reset_cover();
-#endif
+    new_points_covered = false;
+    bool check_snapshot = false;
 
     int ret = 0;
     // bool done_reset = false;
@@ -228,13 +272,14 @@ static int run_sim(const uint8_t *input, size_t input_len,
     const int reset_cycles = 10;
 
     while (trace_count < max_cycles && !sig_exit) {
-        if (Verilated::gotError() || Verilated::gotFinish())
-        // if (Verilated::gotError())
+        if (contextp->gotError() || contextp->gotFinish())
             break;
         // if (done_reset)
         //     break;
         
         // printf("Cycle %lu: reset=%d\n", trace_count, (trace_count < (uint64_t)reset_cycles) ? 1 : 0);
+
+        check_snapshot = new_points_covered;
 
         top->clock = 0;
         if (!run_snapshot) {
@@ -244,13 +289,12 @@ static int run_sim(const uint8_t *input, size_t input_len,
         }
         // done_reset = !top->reset;
         top->eval();
-        if (Verilated::gotError()) break;
+        if (contextp->gotError()) break;
 
 #if VM_TRACE
         if (tfp) tfp->dump(static_cast<vluint64_t>(trace_count * 2));
-        if (dump_snapshot && trace_count == snapshot_cycle) {
-            snapshot_tfp = new TraceFile;
-            top->trace(snapshot_tfp, 99);
+        if (dump_snapshot && check_snapshot && snapshot_tfp) {
+            printf("Control cover points covered at cycle %lu\n", trace_count);
             snapshot_tfp->open(snapshot_wavefile_name(trace_count));
             snapshot_tfp->dump(static_cast<vluint64_t>(trace_count * 2));
         }
@@ -258,23 +302,35 @@ static int run_sim(const uint8_t *input, size_t input_len,
 
         top->clock = 1;
         top->eval();
-        if (Verilated::gotError()) break;
+        if (contextp->gotError()) break;
 
 #if VM_TRACE
         if (tfp) tfp->dump(static_cast<vluint64_t>(trace_count * 2 + 1));
-        if (dump_snapshot && trace_count == snapshot_cycle && snapshot_tfp) {
+        if (dump_snapshot && check_snapshot && snapshot_tfp) {
             snapshot_tfp->dump(static_cast<vluint64_t>(trace_count * 2 + 1));
             snapshot_tfp->close();
-            delete snapshot_tfp;
-            snapshot_tfp = nullptr;
-            printf("Snapshot VCD saved: %s\n", snapshot_wavefile_name(trace_count));
+            printf("Snapshot FST saved: %s\n", snapshot_wavefile_name(trace_count));
+            new_points_covered = false;
+            // write control cover points to file
+            FILE *fp = fopen(control_cover_points_file_name(trace_count), "w");
+            if (fp) {
+                fprintf(fp, "Index,Covered\n");
+                for (int i = 0; i < n_cover_types; i++) {
+                    if (strcmp(firrtl_cover[i].cover.name, "control") == 0) {
+                        for (uint64_t j = 0; j < firrtl_cover[i].cover.total; j++) {
+                            fprintf(fp, "%lu,%d\n", j, firrtl_cover[i].cover.points[j] ? 1 : 0);
+                        }
+                    }
+                }
+                fclose(fp);
+            }
         }
 #endif
         // printf("Cycle %lu: sig_exit=%s\n", trace_count, sig_exit ? "true" : "false");
         trace_count++;
     }
 
-    if (Verilated::gotError()) {
+    if (contextp->gotError()) {
         ret = 1;
     } else if (trace_count >= max_cycles) {
         ret = 2;
@@ -284,13 +340,11 @@ static int run_sim(const uint8_t *input, size_t input_len,
            (ret == 0) ? "PASS" : (ret == 1) ? "FAIL" : "TIMEOUT");
 
 #if VM_TRACE
-    if (tfp) {
-        tfp->close();
-        delete tfp;
-    }
+    if (tfp) tfp->close();
 #endif
 
     delete top;
+    delete contextp;
     return ret;
 }
 
@@ -358,16 +412,16 @@ extern "C" int sim_main(int argc, const char **argv) {
     }
 
 #ifdef FIRRTL_COVER
-    init_acc_cover();
+    // free_acc_cover();
+    // init_acc_cover();
     reset_cover();
 #endif
 
     int ret = run_sim(input, input_len, max_cycles, wave_path);
 
 #ifdef FIRRTL_COVER
-    accumulate_cover();
+    // accumulate_cover();
     display_cover();
-    free_acc_cover();
 #endif
 
     if (!input_is_borrowed)
@@ -441,6 +495,7 @@ int main(int argc, char **argv) {
 
 #ifdef FIRRTL_COVER
     init_acc_cover();
+    reset_cover();
 #endif
 
     int ret = run_sim(input, input_len, max_cycles, vcd_path);
