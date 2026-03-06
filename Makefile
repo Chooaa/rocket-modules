@@ -1,5 +1,5 @@
 # .PHONY: bootrom sim-verilog emu src fuzzer ccover modules clean idea init verilog clean-all
-.PHONY: modules
+.PHONY: modules ccover
 
 CHISEL_VERSION = 6.5.0
 

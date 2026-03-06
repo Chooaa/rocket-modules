@@ -414,14 +414,14 @@ extern "C" int sim_main(int argc, const char **argv) {
 #ifdef FIRRTL_COVER
     // free_acc_cover();
     // init_acc_cover();
-    reset_cover();
+    // reset_cover();
 #endif
 
     int ret = run_sim(input, input_len, max_cycles, wave_path);
 
 #ifdef FIRRTL_COVER
     // accumulate_cover();
-    display_cover();
+    // display_cover();
 #endif
 
     if (!input_is_borrowed)
