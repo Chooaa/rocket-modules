@@ -124,44 +124,56 @@ static void display_cover() {
 }
 #endif // FIRRTL_COVER
 
-// ── Accumulative coverage for fuzzer feedback ────────────────────────
+// ── Accumulative control coverage for fuzzer feedback ────────────────────────
 #ifdef FIRRTL_COVER
-static uint8_t **acc_cover = nullptr;
+uint64_t acc_cover_size = 0;
+uint64_t acc_covered_num = 0;
+uint8_t *acc_cover;
 
 static void init_acc_cover() {
-    acc_cover = new uint8_t *[n_cover_types];
     for (int i = 0; i < n_cover_types; i++) {
-        acc_cover[i] = new uint8_t[firrtl_cover[i].cover.total]();
+        if (strcmp(firrtl_cover[i].cover.name, "control") == 0) {
+            acc_cover = new uint8_t[firrtl_cover[i].cover.total]();
+            acc_cover_size = firrtl_cover[i].cover.total;
+            acc_covered_num = 0;
+            memset(acc_cover, 0, acc_cover_size);
+            break;
+        }
     }
 }
 
 static void accumulate_cover() {
     for (int i = 0; i < n_cover_types; i++) {
-        for (uint64_t j = 0; j < firrtl_cover[i].cover.total; j++) {
-            if (firrtl_cover[i].cover.points[j]) {
-                acc_cover[i][j] = 1;
+        if (strcmp(firrtl_cover[i].cover.name, "control") == 0) {
+            for (uint64_t j = 0; j < firrtl_cover[i].cover.total; j++) {
+                if (firrtl_cover[i].cover.points[j]) {
+                    acc_cover[j] = 1;
+                }
             }
         }
     }
 }
 
-static uint32_t get_acc_cover_hit() {
-    uint32_t hit = 0;
-    for (int i = 0; i < n_cover_types; i++) {
-        for (uint64_t j = 0; j < firrtl_cover[i].cover.total; j++) {
-            if (acc_cover[i][j]) hit++;
-        }
-    }
-    return hit;
-}
-
 static void free_acc_cover() {
     if (acc_cover) {
-        for (int i = 0; i < n_cover_types; i++) delete[] acc_cover[i];
         delete[] acc_cover;
         acc_cover = nullptr;
     }
 }
+
+static void display_acc_cover() {
+    // uint64_t total = 0;
+    // for (uint64_t j = 0; j < acc_cover_size; j++) {
+    //     if (acc_cover[j]) total++;
+    // }
+    // fprintf(stderr, "ACC_COVER: %lu / %lu (%.1f%%)\n", total, acc_cover_size,
+    //         acc_cover_size ? 100.0 * total / acc_cover_size : 0.0);
+    printf("ACC_COVER: %lu / %lu (%.1f%%)\n", acc_covered_num, acc_cover_size,
+            acc_cover_size ? 100.0 * acc_covered_num / acc_cover_size : 0.0);
+    // printf("ACC_COVER: %lu / %lu (%.1f%%)\n", total, acc_cover_size,
+    //         acc_cover_size ? 100.0 * total / acc_cover_size : 0.0);
+}
+
 #endif // FIRRTL_COVER
 
 // ── Exported interface for fuzzer library ────────────────────────────
@@ -294,7 +306,7 @@ static int run_sim(const uint8_t *input, size_t input_len,
 #if VM_TRACE
         if (tfp) tfp->dump(static_cast<vluint64_t>(trace_count * 2));
         if (dump_snapshot && check_snapshot && snapshot_tfp) {
-            printf("Control cover points covered at cycle %lu\n", trace_count);
+            // printf("Control cover points covered at cycle %lu\n", trace_count);
             snapshot_tfp->open(snapshot_wavefile_name(trace_count));
             snapshot_tfp->dump(static_cast<vluint64_t>(trace_count * 2));
         }
@@ -312,15 +324,12 @@ static int run_sim(const uint8_t *input, size_t input_len,
             printf("Snapshot FST saved: %s\n", snapshot_wavefile_name(trace_count));
             new_points_covered = false;
             // write control cover points to file
+            display_acc_cover();
             FILE *fp = fopen(control_cover_points_file_name(trace_count), "w");
             if (fp) {
                 fprintf(fp, "Index,Covered\n");
-                for (int i = 0; i < n_cover_types; i++) {
-                    if (strcmp(firrtl_cover[i].cover.name, "control") == 0) {
-                        for (uint64_t j = 0; j < firrtl_cover[i].cover.total; j++) {
-                            fprintf(fp, "%lu,%d\n", j, firrtl_cover[i].cover.points[j] ? 1 : 0);
-                        }
-                    }
+                for (uint64_t j = 0; j < acc_cover_size; j++) {
+                    fprintf(fp, "%lu,%d\n", j, acc_cover[j] ? 1 : 0);
                 }
                 fclose(fp);
             }
@@ -412,14 +421,15 @@ extern "C" int sim_main(int argc, const char **argv) {
     }
 
 #ifdef FIRRTL_COVER
-    // free_acc_cover();
-    // init_acc_cover();
+    init_acc_cover();
     // reset_cover();
 #endif
 
     int ret = run_sim(input, input_len, max_cycles, wave_path);
 
 #ifdef FIRRTL_COVER
+    // display_acc_cover();
+    free_acc_cover();
     // accumulate_cover();
     // display_cover();
 #endif
@@ -501,7 +511,7 @@ int main(int argc, char **argv) {
     int ret = run_sim(input, input_len, max_cycles, vcd_path);
 
 #ifdef FIRRTL_COVER
-    accumulate_cover();
+    // accumulate_cover();
     display_cover();
     uint32_t total = get_cover_total();
     uint32_t hit = get_acc_cover_hit();

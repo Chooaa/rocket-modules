@@ -676,6 +676,12 @@ def filter_cover_cpp(input_path, output_path, allowed_modules):
         "        extern bool new_points_covered;\n"
         "        new_points_covered = true;\n"
         "    }\n"
+        "    if (acc_cover[index] == 0) {\n"
+        "        extern uint64_t acc_covered_num;\n"
+        "        acc_covered_num++;\n"
+        "    }\n"
+        "    acc_cover[index] = 1;\n"
+        "}"
     )
     result = re.sub(
         r'(extern "C" void v_cover_control\(uint64_t index\) \{\n)'
