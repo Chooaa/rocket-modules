@@ -376,40 +376,58 @@ line_cover_id = 0
 mux_cover_id = 0
 control_cover_id = 0
 
+def _cover_increment(kind, width):
+    """计算一个 GEN_wN_<kind> 实例占用的 cover point 数量。
+
+    - toggle / line / mux: valid 每一位独立触发，占 width 个点
+    - control w1: 仅在 valid==1 时触发，占 1 个点
+    - control w2+: COVER_INDEX + valid，valid 范围 0~2^width-1，占 2^width 个点
+    """
+    if kind == "control":
+        return 1 if width == 1 else (1 << width)
+    return width
+
+
 def renumber_cover_points(module_text):
-    """对单个模块内的覆盖点（toggle_N, line_N, mux_N, control_N）重新编号，从 0 开始。
+    """对单个模块内的覆盖点（toggle_N, line_N, mux_N, control_N）重新编号。
 
     处理的结构包括:
       - wire/reg 声明: wire mux_N_clock; reg mux_N_valid_reg;
-      - 实例化: GEN_w1_mux #(.COVER_INDEX(N)) mux_N (
+      - 实例化: GEN_wW_kind #(.COVER_INDEX(N)) kind_N (
       - 端口连接: .clock(mux_N_clock),
       - assign 语句: assign mux_N_valid = ...;
       - always 块: mux_N_valid_reg <= ...;
       - initial 块: mux_N_valid_reg = _RAND_...;
 
-    toggle, line, mux, control 各自独立编号，均从 0 开始。
+    cover ID 增量规则:
+      - toggle / line / mux: 每实例 +width（valid 每位一个点）
+      - control w1: +1
+      - control w2+: +2^width
 
     Returns:
         (renumbered_text, cover_counts, rename_map)
         cover_counts: dict with keys "toggle", "line", "mux", "control"
+                      值为该类型的总 cover point 数量
     """
     cover_kinds = ("toggle", "line", "mux", "control")
     kind_alt = "|".join(cover_kinds)
     inst_alt = "|".join(rf"{k}_\d+" for k in cover_kinds)
 
     inst_pattern = re.compile(
-        rf'GEN_w\d+_({kind_alt})\s+#\(\.COVER_INDEX\(\d+\)\)\s+({inst_alt})\s+\('
+        rf'GEN_w(\d+)_({kind_alt})\s+#\(\.COVER_INDEX\(\d+\)\)\s+({inst_alt})\s+\('
     )
 
-    old_names = {k: [] for k in cover_kinds}
+    # (kind, inst_name, width) 保留出现顺序
+    old_entries = {k: [] for k in cover_kinds}
     seen = set()
 
     for m in inst_pattern.finditer(module_text):
-        kind = m.group(1)
-        inst_name = m.group(2)
+        width = int(m.group(1))
+        kind = m.group(2)
+        inst_name = m.group(3)
         if inst_name not in seen:
             seen.add(inst_name)
-            old_names[kind].append(inst_name)
+            old_entries[kind].append((inst_name, width))
 
     rename_map = {}
     global toggle_cover_id, line_cover_id, mux_cover_id, control_cover_id
@@ -423,10 +441,13 @@ def renumber_cover_points(module_text):
     cover_counts = {}
     for kind in cover_kinds:
         cid = cover_id_map[kind]
-        for old_name in old_names[kind]:
+        total_points = 0
+        for old_name, width in old_entries[kind]:
             rename_map[old_name] = f"{kind}_{cid}"
-            cid += 1
-        cover_counts[kind] = len(old_names[kind])
+            inc = _cover_increment(kind, width)
+            cid += inc
+            total_points += inc
+        cover_counts[kind] = total_points
         cover_id_map[kind] = cid
 
     toggle_cover_id = cover_id_map["toggle"]
@@ -676,12 +697,12 @@ def filter_cover_cpp(input_path, output_path, allowed_modules):
         "        extern bool new_points_covered;\n"
         "        new_points_covered = true;\n"
         "    }\n"
+        "    extern uint8_t *acc_cover;\n"
         "    if (acc_cover[index] == 0) {\n"
         "        extern uint64_t acc_covered_num;\n"
         "        acc_covered_num++;\n"
         "    }\n"
         "    acc_cover[index] = 1;\n"
-        "}"
     )
     result = re.sub(
         r'(extern "C" void v_cover_control\(uint64_t index\) \{\n)'
@@ -817,10 +838,10 @@ def generate_fuzz_wrapper(sv_path, mod_name, output_path=None):
         bit_offset += width
     
     # 将input按顺序保存到文件
-    fuzz_input_file = os.path.join(SCRIPT_DIR, "fuzz_inputs.txt")
-    with open(fuzz_input_file, "w") as f:
-        for _, width, name in fuzz_inputs:
-            f.write(f"{name}\n")
+    # fuzz_input_file = os.path.join(SCRIPT_DIR, "fuzz_inputs.txt")
+    # with open(fuzz_input_file, "w") as f:
+    #     for _, width, name in fuzz_inputs:
+    #         f.write(f"{name}\n")
 
     # 为 output 声明 wire
     outputs = [(d, w, n) for d, w, n in all_ports if d == "output"]
@@ -859,9 +880,12 @@ def generate_fuzz_wrapper(sv_path, mod_name, output_path=None):
 def generate_formal_wrapper(sv_path, mod_name, output_path=None):
     """生成形式验证顶层包裹模块 FormalTop.sv。
 
-    与 SimTop (fuzz wrapper) 不同，FormalTop 将 DUT 的所有非 clock/reset 端口
-    直接暴露为顶层端口，使用 (* gclk *) 全局时钟和 reg_reset 复位逻辑，
-    适用于 SymbiYosys 等形式验证工具。
+    采用与 generate_fuzz_wrapper 相同的 reg_input 切片结构:
+      - 所有 DUT input（除 clock/reset）打包到一个宽 reg_input 中
+      - 各 DUT input 从 reg_input 中切片赋值
+    不同之处:
+      - reg_input 的数据来源是 FormalTop 的 input 端口（而非 fuzz_get_byte）
+      - 使用 (* gclk *) 全局时钟和 reg_reset 复位逻辑
 
     Args:
         sv_path: SV 文件路径（用于解析 mod_name 的端口）
@@ -872,79 +896,84 @@ def generate_formal_wrapper(sv_path, mod_name, output_path=None):
     """
     ports = parse_module_ports(sv_path, mod_name)
 
-    skip_ports = {"clock", "reset"}
-    exposed_ports = [(d, w, n) for d, w, n in ports if n not in skip_ports]
-    input_ports = [(d, w, n) for d, w, n in exposed_ports if d == "input"]
-    output_ports = [(d, w, n) for d, w, n in exposed_ports if d != "input"]
+    skip_inputs = {"clock", "reset"}
+    fuzz_inputs = [(d, w, n) for d, w, n in ports
+                   if d == "input" and n not in skip_inputs]
+    all_ports = ports
 
-    module_ranges, orig_lines = find_module_ranges(sv_path)
-    port_comments = {}
-    if mod_name in module_ranges:
-        start, end = module_ranges[mod_name]
-        for orig_line in orig_lines[start:end + 1]:
-            for _, _, pname in ports:
-                if re.search(rf'\b{re.escape(pname)}\b', orig_line):
-                    cm = re.search(r'(//.*)', orig_line)
-                    if cm:
-                        port_comments[pname] = f" {cm.group(1)}"
+    total_width = sum(w for _, w, _ in fuzz_inputs)
+    n_bytes = (total_width + 7) // 8
+    padded_width = n_bytes * 8
 
     lines = []
-    lines.append("`define SYNTHESIS")
-    lines.append("module FormalTop (")
-    # FormalTop 仅保留 input 端口；output 在模块内用 wire 声明
-    port_decls = []
-    for direction, width, name in input_ports:
+    lines.append(f"`define SYNTHESIS")
+    lines.append(f"module FormalTop (")
+    lines.append(f"  input [{padded_width - 1}:0] formal_input")
+    lines.append(f");")
+    lines.append(f"")
+
+    # 全局时钟 & 复位
+    lines.append(f"  (* gclk *) wire glb_clk;")
+    lines.append(f"  wire clock;")
+    lines.append(f"  wire reset;")
+    lines.append(f"")
+    lines.append(f"  reg reg_reset = 1'b1;")
+    lines.append(f"  always @(posedge glb_clk) begin")
+    lines.append(f"    if (reg_reset) begin")
+    lines.append(f"      reg_reset <= 1'b0;")
+    lines.append(f"    end")
+    lines.append(f"  end")
+    lines.append(f"")
+    lines.append(f"  assign clock = glb_clk;")
+    lines.append(f"  assign reset = reg_reset;")
+    lines.append(f"")
+
+    # reg_input 从 formal_input 获取数据
+    lines.append(f"  // 总 fuzz 输入位宽: {total_width}, 对齐到字节: {padded_width} ({n_bytes} bytes)")
+    lines.append(f"  reg [{padded_width - 1}:0] reg_input;")
+    lines.append(f"  always @(posedge glb_clk) begin")
+    lines.append(f"    if (reset) begin")
+    lines.append(f"      reg_input <= {padded_width}'b0;")
+    lines.append(f"    end else begin")
+    lines.append(f"      reg_input <= formal_input;")
+    lines.append(f"    end")
+    lines.append(f"  end")
+    lines.append(f"")
+
+    # 为每个 fuzz input 声明 wire 并从 reg_input 中切片赋值
+    bit_offset = 0
+    lines.append(f"  // fuzz input 信号声明与赋值")
+    for _, width, name in fuzz_inputs:
         if width == 1:
-            port_decls.append(f"  {direction:6s}        {name}")
+            lines.append(f"  wire {name};")
+            lines.append(f"  assign {name} = reg_input[{bit_offset}];")
         else:
-            port_decls.append(f"  {direction:6s} [{width - 1}:0] {name}")
+            lines.append(f"  wire [{width - 1}:0] {name};")
+            lines.append(f"  assign {name} = reg_input[{bit_offset + width - 1}:{bit_offset}];")
+        bit_offset += width
 
-    for i, decl in enumerate(port_decls):
-        comment = port_comments.get(input_ports[i][2], "")
-        sep = "," if i < len(port_decls) - 1 else ""
-        lines.append(f"{decl}{sep}{comment}")
+    # 为 output 声明 wire
+    outputs = [(d, w, n) for d, w, n in all_ports if d == "output"]
+    if outputs:
+        lines.append(f"")
+        lines.append(f"  // output 信号声明")
+        for _, width, name in outputs:
+            if width == 1:
+                lines.append(f"  wire {name};")
+            else:
+                lines.append(f"  wire [{width - 1}:0] {name};")
 
-    lines.append(");")
-
-    lines.append("(* gclk *) wire glb_clk;")
-    lines.append("wire clock;")
-    lines.append("wire reset;")
-    # DUT output 端口用 wire 声明
-    for direction, width, name in output_ports:
-        comment = port_comments.get(name, "")
-        if width == 1:
-            lines.append(f"wire {name};{comment}")
-        else:
-            lines.append(f"wire [{width - 1}:0] {name};{comment}")
-    if output_ports:
-        lines.append("")
-    lines.append("")
-    lines.append("reg reg_reset = 1'b1;")
-    lines.append("always @(posedge glb_clk) begin")
-    lines.append("  if (reg_reset) begin")
-    lines.append("    reg_reset <= 1'b0;")
-    lines.append("  end")
-    lines.append("end")
-    lines.append("")
-    lines.append("assign clock = glb_clk;")
-    lines.append("assign reset = reg_reset;")
-    lines.append("")
-
-    lines.append("")
-    lines.append(f"{mod_name} dut(")
-
+    # 实例化原模块
+    lines.append(f"")
+    lines.append(f"  // 实例化原顶层模块")
+    lines.append(f"  {mod_name} dut (")
     port_conns = []
-    for _, _, name in ports:
-        port_conns.append(f".{name}")
-
-    for i, conn in enumerate(port_conns):
-        comment = port_comments.get(ports[i][2], "")
-        sep = "," if i < len(port_conns) - 1 else ""
-        lines.append(f"{conn}{sep}{comment}")
-
-    lines.append(");")
-    lines.append("")
-    lines.append("endmodule")
+    for _, _, name in all_ports:
+        port_conns.append(f"    .{name}({name})")
+    lines.append(",\n".join(port_conns))
+    lines.append(f"  );")
+    lines.append(f"")
+    lines.append(f"endmodule")
 
     text = "\n".join(lines) + "\n"
 
@@ -952,7 +981,7 @@ def generate_formal_wrapper(sv_path, mod_name, output_path=None):
         with open(output_path, "w") as f:
             f.write(text)
         print(f"[INFO] 已生成 FormalTop 包裹模块 -> {output_path}")
-        print(f"[INFO] 包裹模块: {mod_name}, input 端口: {len(input_ports)}, output 用 wire: {len(output_ports)}")
+        print(f"[INFO] 包裹模块: {mod_name}, fuzz 输入位宽: {total_width}, output 用 wire: {len(outputs)}")
     else:
         return text
 

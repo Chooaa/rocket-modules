@@ -237,7 +237,8 @@ uint64_t snapshot_cycle = 0;
 
 // ── Simulation core ──────────────────────────────────────────────────
 
-static int run_sim(const uint8_t *input, size_t input_len,
+static int run_sim(int argc, const char **argv,
+                   const uint8_t *input, size_t input_len,
                    uint64_t max_cycles, const char *vcd_path) {
     fuzz_buf = input;
     fuzz_buf_len = input_len;
@@ -248,6 +249,7 @@ static int run_sim(const uint8_t *input, size_t input_len,
     // Per-run context: avoids stale traceBaseModelCb accumulation in the
     // global default context across repeated sim_main calls.
     VerilatedContext *contextp = new VerilatedContext;
+    contextp->commandArgs(argc, argv);
     contextp->randReset(2);
     contextp->gotError(false);
     contextp->gotFinish(false);
@@ -349,7 +351,14 @@ static int run_sim(const uint8_t *input, size_t input_len,
            (ret == 0) ? "PASS" : (ret == 1) ? "FAIL" : "TIMEOUT");
 
 #if VM_TRACE
-    if (tfp) tfp->close();
+    if (snapshot_tfp) {
+        snapshot_tfp->close();
+        delete snapshot_tfp;
+    }
+    if (tfp) {
+        tfp->close();
+        delete tfp;
+    }
 #endif
 
     delete top;
@@ -362,8 +371,6 @@ static int run_sim(const uint8_t *input, size_t input_len,
 #ifdef FUZZER_LIB
 
 extern "C" int sim_main(int argc, const char **argv) {
-    Verilated::commandArgs(argc, argv);
-
     uint64_t max_cycles = 10000;
     const char *wave_path = nullptr;
     for (int i = 1; i < argc; i++) {
@@ -375,7 +382,7 @@ extern "C" int sim_main(int argc, const char **argv) {
         else if (strcmp(argv[i], "--dump-wave") == 0) {
             wave_path = argv[++i];
         }
-        else if (strncmp(argv[i], "--fuzz-id", 11) == 0 && i + 1 < argc) {
+        else if (strcmp(argv[i], "--fuzz-id") == 0 && i + 1 < argc) {
             fuzz_id = strtoull(argv[++i], nullptr, 10);
         }
         else if (strcmp(argv[i], "--run-snapshot") == 0) {
@@ -425,7 +432,7 @@ extern "C" int sim_main(int argc, const char **argv) {
     // reset_cover();
 #endif
 
-    int ret = run_sim(input, input_len, max_cycles, wave_path);
+    int ret = run_sim(argc, argv, input, input_len, max_cycles, wave_path);
 
 #ifdef FIRRTL_COVER
     // display_acc_cover();
@@ -478,8 +485,6 @@ int main(int argc, char **argv) {
         srand48(seed);
     }
 
-    Verilated::commandArgs(argc, argv);
-
     uint8_t *input = nullptr;
     size_t input_len = 0;
     if (input_path) {
@@ -508,7 +513,7 @@ int main(int argc, char **argv) {
     reset_cover();
 #endif
 
-    int ret = run_sim(input, input_len, max_cycles, vcd_path);
+    int ret = run_sim(argc, (const char **)argv, input, input_len, max_cycles, vcd_path);
 
 #ifdef FIRRTL_COVER
     // accumulate_cover();
