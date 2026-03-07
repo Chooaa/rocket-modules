@@ -44,6 +44,10 @@ PROJECT_CONFIGS = {
         # "root_modules": ["DCache"],
         "description": "DCache (NonBlockingDCache) 模块",
     },
+    "rocket_fpu": {
+        "root_modules": ["FPU"],
+        "description": "FPU 模块",
+    }
 }
 
 
@@ -329,8 +333,11 @@ def collect_submodules(modules, root_name, result=None, skip_generic=True):
     mod = modules.get(root_name)
     if mod is None:
         return result
-    for _, child_mod in mod.instances:
+    for inst_name, child_mod in mod.instances:
         if skip_generic and child_mod.startswith("GEN_w"):
+            continue
+        if "difftest" in child_mod.lower() or "difftest" in inst_name.lower() \
+           or child_mod.startswith("DummyDPIC"):
             continue
         collect_submodules(modules, child_mod, result, skip_generic)
     return result
@@ -563,6 +570,70 @@ def insert_reg_initial(module_text):
     return module_text, total
 
 
+# 实例化匹配: "  ModuleName inst_name (" 或 "  ModuleName #(...) inst_name ("
+_INST_HEAD_RE = re.compile(r'^\s+(\w+)\s+(?:#\(.*?\)\s+)?(\w+)\s*\(')
+
+
+def strip_difftest_instances(module_text):
+    """从模块文本中移除所有与 difftest 相关的实例化、wire 声明和 assign 语句。
+
+    移除的内容:
+      1. wire 声明:  wire [...] difftest_*;
+      2. 实例化块:   ModuleName difftest_* ( ... );  (跨多行)
+      3. assign 语句: assign difftest_* = ...;
+    """
+    lines = module_text.splitlines(keepends=True)
+    out = []
+    i = 0
+    removed = 0
+    in_difftest_inst = False
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # --- 正在跳过 difftest 实例化块 ---
+        if in_difftest_inst:
+            removed += 1
+            if stripped.endswith(");"):
+                in_difftest_inst = False
+            i += 1
+            continue
+
+        # --- wire 声明: wire [...] difftest_*; ---
+        if re.match(r'\s+wire\s.*\bdifftest_\w+\s*;', line):
+            removed += 1
+            i += 1
+            continue
+
+        # --- assign 语句: assign difftest_* = ...; ---
+        if re.match(r'\s+assign\s+difftest_\w+', line):
+            removed += 1
+            i += 1
+            continue
+
+        # --- 实例化头: ModuleName difftest_instance ( ---
+        m = _INST_HEAD_RE.match(line)
+        if m:
+            mod_type = m.group(1)
+            inst_name = m.group(2)
+            if "difftest" in inst_name.lower() or "difftest" in mod_type.lower() \
+               or mod_type.startswith("DummyDPIC"):
+                in_difftest_inst = True
+                removed += 1
+                if stripped.endswith(");"):
+                    in_difftest_inst = False
+                i += 1
+                continue
+
+        out.append(line)
+        i += 1
+
+    if removed:
+        print(f"[INFO] strip_difftest: 移除 {removed} 行 difftest 相关代码")
+    return "".join(out)
+
+
 def extract_modules(sv_path, mod_names, output_path=None, renumber=True, insert_initial=True):
     """从 SV 文件中提取指定模块的代码。
 
@@ -600,6 +671,8 @@ def extract_modules(sv_path, mod_names, output_path=None, renumber=True, insert_
 
     for mod_name, (start, end) in sorted_mods:
         mod_text = "".join(lines[start:end + 1])
+
+        mod_text = strip_difftest_instances(mod_text)
 
         if renumber:
             mod_text, counts, rmap = renumber_cover_points(mod_text)
