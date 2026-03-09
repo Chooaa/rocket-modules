@@ -47,7 +47,11 @@ PROJECT_CONFIGS = {
     "rocket_fpu": {
         "root_modules": ["FPU"],
         "description": "FPU 模块",
-    }
+    },
+    "rocket_frontend": {
+        "root_modules": ["Frontend"],
+        "description": "Frontend 模块",
+    },
 }
 
 
