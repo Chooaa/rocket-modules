@@ -162,9 +162,12 @@ def setup_project(project_name, include_generic=False, renumber=True, insert_ini
     print(f"[INFO] 目标模块 (root: {', '.join(root_modules)}): 共 {len(target_mods)} 个")
 
     # ---- Step 3: 从源 SimTop.sv 提取目标模块代码 ----
+    # Fuzz 版本带 initial 语句，Formal 版本不插入 initial
     print(f"\n--- Step 3: 提取目标模块代码 ---")
-    extracted_text = extract_modules(src_simtop, target_mods,
-                                     renumber=renumber, insert_initial=insert_initial)
+    extracted_text_fuzz = extract_modules(src_simtop, target_mods,
+                                          renumber=renumber, insert_initial=insert_initial)
+    extracted_text_formal = extract_modules(src_simtop, target_mods,
+                                            renumber=renumber, insert_initial=insert_initial)
 
     # ---- Step 4: 生成顶层 fuzz wrapper (SimTop.sv) 并追加提取的模块代码 ----
     wrapper_sv = os.path.join(RTL_DIR, "SimTop.sv")
@@ -174,7 +177,7 @@ def setup_project(project_name, include_generic=False, renumber=True, insert_ini
 
     with open(wrapper_sv, "a") as f:
         f.write("\n")
-        f.write(extracted_text)
+        f.write(extracted_text_fuzz)
     print(f"[INFO] 已将提取的模块代码追加到 {wrapper_sv}")
 
     # ---- Step 5: 复制并过滤 firrtl-cover 文件 ----
@@ -214,7 +217,7 @@ def setup_project(project_name, include_generic=False, renumber=True, insert_ini
 
     with open(formal_sv, "a") as f:
         f.write("\n")
-        f.write(extracted_text)
+        f.write(extracted_text_formal)
     print(f"[INFO] 已将提取的模块代码追加到 {formal_sv}")
 
     print(f"\n{'=' * 70}")
@@ -496,17 +499,15 @@ def renumber_cover_points(module_text):
 
 
 def insert_reg_initial(module_text):
-    """为模块中的所有寄存器插入 initial(!reg) = 0 的初始化语句。
+    """为模块中的所有寄存器插入 initial begin ... end 赋值初始化语句。
 
     对于普通寄存器 reg [N:0] foo:
-        initial(!foo);
+        foo = '0;
 
     对于存储器数组 reg [N:0] foo [0:M]:
-        integer _init_i;
-        initial begin
-          for (_init_i = 0; _init_i <= M; _init_i = _init_i + 1)
-            foo[_init_i] = '0;
-        end
+        foo[0] = '0;
+        foo[1] = '0;
+        ...
 
     跳过 _RAND_* 辅助寄存器。
     """
@@ -548,17 +549,13 @@ def insert_reg_initial(module_text):
         return module_text, 0
 
     init_lines = []
-    for name in scalar_regs:
-        init_lines.append(f"  initial assume(!{name});")
-
-    if mem_regs:
-        init_lines.append("  integer _init_i;")
+    if scalar_regs or mem_regs:
         init_lines.append("  initial begin")
+        for name in scalar_regs:
+            init_lines.append(f"    {name} = '0;")
         for name, lo, hi in mem_regs:
-            init_lines.append(
-                f"    for (_init_i = {lo}; _init_i <= {hi}; "
-                f"_init_i = _init_i + 1)")
-            init_lines.append(f"      {name}[_init_i] = '0;")
+            for i in range(lo, hi + 1):
+                init_lines.append(f"    {name}[{i}] = '0;")
         init_lines.append("  end")
 
     init_block = "\n".join(init_lines) + "\n"
