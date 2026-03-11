@@ -166,8 +166,8 @@ def setup_project(project_name, include_generic=False, renumber=True, insert_ini
     print(f"\n--- Step 3: 提取目标模块代码 ---")
     extracted_text_fuzz = extract_modules(src_simtop, target_mods,
                                           renumber=renumber, insert_initial=insert_initial)
-    extracted_text_formal = extract_modules(src_simtop, target_mods,
-                                            renumber=renumber, insert_initial=insert_initial)
+    # extracted_text_formal = extract_modules(src_simtop, target_mods,
+    #                                         renumber=renumber, insert_initial=insert_initial)
 
     # ---- Step 4: 生成顶层 fuzz wrapper (SimTop.sv) 并追加提取的模块代码 ----
     wrapper_sv = os.path.join(RTL_DIR, "SimTop.sv")
@@ -217,7 +217,7 @@ def setup_project(project_name, include_generic=False, renumber=True, insert_ini
 
     with open(formal_sv, "a") as f:
         f.write("\n")
-        f.write(extracted_text_formal)
+        f.write(extracted_text_fuzz)
     print(f"[INFO] 已将提取的模块代码追加到 {formal_sv}")
 
     print(f"\n{'=' * 70}")
