@@ -52,6 +52,10 @@ PROJECT_CONFIGS = {
         "root_modules": ["Frontend"],
         "description": "Frontend 模块",
     },
+    "boom_dcache": {
+        "root_modules": ["BoomNonBlockingDCache"],
+        "description": "DCache (BoomNonBlockingDCache) 模块",
+    },
 }
 
 
@@ -167,13 +171,13 @@ def setup_project(project_name, include_generic=False, renumber=True, insert_ini
     extracted_text_fuzz = extract_modules(src_simtop, target_mods,
                                           renumber=renumber, insert_initial=insert_initial)
     # extracted_text_formal = extract_modules(src_simtop, target_mods,
-    #                                         renumber=renumber, insert_initial=insert_initial)
+                                            # renumber=renumber, insert_initial=insert_initial)
 
     # ---- Step 4: 生成顶层 fuzz wrapper (SimTop.sv) 并追加提取的模块代码 ----
     wrapper_sv = os.path.join(RTL_DIR, "SimTop.sv")
     fuzz_top = root_modules[0]
     print(f"\n--- Step 4: 生成顶层包裹 SimTop.sv (包裹 {fuzz_top}) ---")
-    generate_fuzz_wrapper(src_simtop, fuzz_top, wrapper_sv)
+    generate_fuzz_wrapper(src_simtop, fuzz_top, wrapper_sv, insert_initial=insert_initial)
 
     with open(wrapper_sv, "a") as f:
         f.write("\n")
@@ -213,7 +217,7 @@ def setup_project(project_name, include_generic=False, renumber=True, insert_ini
     # ---- Step 7: 生成形式验证顶层 FormalTop.sv (放在 SCRIPT_DIR 而非 RTL_DIR) ----
     formal_sv = os.path.join(SCRIPT_DIR, "FormalTop.sv")
     print(f"\n--- Step 7: 生成形式验证顶层 FormalTop.sv (包裹 {fuzz_top}) ---")
-    generate_formal_wrapper(src_simtop, fuzz_top, formal_sv)
+    generate_formal_wrapper(src_simtop, fuzz_top, formal_sv, insert_initial=insert_initial)
 
     with open(formal_sv, "a") as f:
         f.write("\n")
@@ -343,8 +347,8 @@ def collect_submodules(modules, root_name, result=None, skip_generic=True):
     for inst_name, child_mod in mod.instances:
         if skip_generic and child_mod.startswith("GEN_w"):
             continue
-        if "difftest" in child_mod.lower() or "difftest" in inst_name.lower() \
-           or child_mod.startswith("DummyDPIC"):
+        if inst_name.startswith("difftest_"):
+            print(f"[INFO] collect_submodules: 跳过 difftest 实例化 {inst_name}")
             continue
         collect_submodules(modules, child_mod, result, skip_generic)
     return result
@@ -576,12 +580,11 @@ _INST_HEAD_RE = re.compile(r'^\s+(\w+)\s+(?:#\(.*?\)\s+)?(\w+)\s*\(')
 
 
 def strip_difftest_instances(module_text):
-    """从模块文本中移除所有与 difftest 相关的实例化、wire 声明和 assign 语句。
+    """从模块文本中移除 difftest 相关的实例化块（实例名以 difftest_ 开头）。
 
-    移除的内容:
-      1. wire 声明:  wire [...] difftest_*;
-      2. 实例化块:   ModuleName difftest_* ( ... );  (跨多行)
-      3. assign 语句: assign difftest_* = ...;
+    仅移除实例化块（ModuleName difftest_* ( ... );），保留 difftest 相关的
+    wire 声明和 assign 语句。被实例化的模块定义（如 DelayReg）由
+    collect_submodules 排除，不会被提取。
     """
     lines = module_text.splitlines(keepends=True)
     out = []
@@ -593,7 +596,6 @@ def strip_difftest_instances(module_text):
         line = lines[i]
         stripped = line.strip()
 
-        # --- 正在跳过 difftest 实例化块 ---
         if in_difftest_inst:
             removed += 1
             if stripped.endswith(");"):
@@ -601,25 +603,10 @@ def strip_difftest_instances(module_text):
             i += 1
             continue
 
-        # --- wire 声明: wire [...] difftest_*; ---
-        if re.match(r'\s+wire\s.*\bdifftest_\w+\s*;', line):
-            removed += 1
-            i += 1
-            continue
-
-        # --- assign 语句: assign difftest_* = ...; ---
-        if re.match(r'\s+assign\s+difftest_\w+', line):
-            removed += 1
-            i += 1
-            continue
-
-        # --- 实例化头: ModuleName difftest_instance ( ---
         m = _INST_HEAD_RE.match(line)
         if m:
-            mod_type = m.group(1)
             inst_name = m.group(2)
-            if "difftest" in inst_name.lower() or "difftest" in mod_type.lower() \
-               or mod_type.startswith("DummyDPIC"):
+            if inst_name.startswith("difftest_"):
                 in_difftest_inst = True
                 removed += 1
                 if stripped.endswith(");"):
@@ -631,7 +618,7 @@ def strip_difftest_instances(module_text):
         i += 1
 
     if removed:
-        print(f"[INFO] strip_difftest: 移除 {removed} 行 difftest 相关代码")
+        print(f"[INFO] strip_difftest: 移除 {removed} 行 difftest 实例化代码")
     return "".join(out)
 
 
@@ -847,7 +834,7 @@ def parse_module_ports(sv_path, mod_name):
     return ports
 
 
-def generate_fuzz_wrapper(sv_path, mod_name, output_path=None):
+def generate_fuzz_wrapper(sv_path, mod_name, output_path=None, insert_initial=False):
     """生成 Fuzz 包裹模块。
 
     原顶层模块的所有 input（除 clock 和 reset）均从 reg_input 输入，
@@ -857,6 +844,7 @@ def generate_fuzz_wrapper(sv_path, mod_name, output_path=None):
         sv_path: SV 文件路径
         mod_name: 要包裹的顶层模块名
         output_path: 输出文件路径，为 None 则返回字符串
+        insert_initial: 是否为 reg_input 插入 initial 语句块
     Returns:
         生成的 wrapper 模块代码字符串
     """
@@ -897,6 +885,10 @@ def generate_fuzz_wrapper(sv_path, mod_name, output_path=None):
     lines.append(f"      end")
     lines.append(f"    end")
     lines.append(f"  end")
+    if insert_initial:
+        lines.append(f"  initial begin")
+        lines.append(f"    reg_input = '0;")
+        lines.append(f"  end")
     lines.append(f"")
 
     # 为每个 fuzz input 声明 wire 并从 reg_input 中切片赋值
@@ -951,7 +943,7 @@ def generate_fuzz_wrapper(sv_path, mod_name, output_path=None):
         return text
 
 
-def generate_formal_wrapper(sv_path, mod_name, output_path=None):
+def generate_formal_wrapper(sv_path, mod_name, output_path=None, insert_initial=False):
     """生成形式验证顶层包裹模块 FormalTop.sv。
 
     采用与 generate_fuzz_wrapper 相同的 reg_input 切片结构:
@@ -965,6 +957,7 @@ def generate_formal_wrapper(sv_path, mod_name, output_path=None):
         sv_path: SV 文件路径（用于解析 mod_name 的端口）
         mod_name: 要包裹的 DUT 模块名
         output_path: 输出文件路径，为 None 则返回字符串
+        insert_initial: 是否为 reg_input 插入 initial 语句块
     Returns:
         生成的 FormalTop 模块代码字符串（当 output_path 为 None 时）
     """
@@ -1012,6 +1005,10 @@ def generate_formal_wrapper(sv_path, mod_name, output_path=None):
     lines.append(f"      reg_input <= formal_input;")
     lines.append(f"    end")
     lines.append(f"  end")
+    if insert_initial:
+        lines.append(f"  initial begin")
+        lines.append(f"    reg_input = '0;")
+        lines.append(f"  end")
     lines.append(f"")
 
     # 为每个 fuzz input 声明 wire 并从 reg_input 中切片赋值
@@ -1247,7 +1244,7 @@ def main():
         print("=" * 70)
         fuzz_top = args.fuzz_top or root_modules[0]
         fuzz_out = args.fuzz_wrapper_output or os.path.join(TMP_DIR, "SimTop.sv")
-        generate_fuzz_wrapper(sv_path, fuzz_top, fuzz_out)
+        generate_fuzz_wrapper(sv_path, fuzz_top, fuzz_out, insert_initial=args.initial)
 
     # 生成形式验证顶层包裹模块
     if args.formal_wrapper or args.all:
@@ -1256,7 +1253,7 @@ def main():
         print("=" * 70)
         fuzz_top = args.fuzz_top or root_modules[0]
         formal_out = args.formal_wrapper_output or os.path.join(SCRIPT_DIR, "FormalTop.sv")
-        generate_formal_wrapper(sv_path, fuzz_top, formal_out)
+        generate_formal_wrapper(sv_path, fuzz_top, formal_out, insert_initial=args.initial)
 
 if __name__ == "__main__":
     main()
